@@ -1,85 +1,191 @@
-from theme import apply_theme, render_sidebar
-from auth import init_auth, require_login
-import streamlit as st
+import io
+from datetime import date
+from pathlib import Path
+
 import pandas as pd
+import streamlit as st
 from pptx import Presentation
-from io import BytesIO
+
+from auth import init_auth, login_form, require_login
+from theme import apply_theme, render_sidebar
 
 COMPANY_NAME = "Pizzeria Insights"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TEMPLATE_PATH = PROJECT_ROOT / "templates" / "weekly_report_template.pptx"
+PREVIEW_PATH = PROJECT_ROOT / "templates" / "weekly_report_preview.png"
 
 apply_theme()
 init_auth()
 
 if not require_login():
-    st.warning("Please log in first.")
+    login_form(COMPANY_NAME)
     st.stop()
 
 render_sidebar(COMPANY_NAME)
 
-st.title("📊 Report Automation (Excel ➜ PowerPoint)")
 
-# ---------------- Upload Files ----------------
-excel_file = st.file_uploader("Upload Excel File", type=["xlsx"])
-ppt_file = st.file_uploader("Upload PowerPoint Template", type=["pptx"])
+def load_data(uploaded_file):
+    if uploaded_file.name.endswith(".csv"):
+        return pd.read_csv(uploaded_file, encoding="utf-8")
 
-if excel_file and ppt_file:
-    df = pd.read_excel(excel_file)
+    return pd.read_excel(uploaded_file)
 
-    st.subheader("Select Columns")
 
-    csat_col = st.selectbox("CSAT Column (1-5)", df.columns)
-    ces_col = st.selectbox("CES Column (1-7)", df.columns)
-    nps_col = st.selectbox("NPS Column (1-10)", df.columns)
+def calculate_csat(df, column_name):
+    data = pd.to_numeric(df[column_name], errors="coerce").dropna()
+    total = len(data)
 
-    st.subheader("Report Info")
+    if total == 0:
+        return 0
 
-    title = st.text_input("Report Title", "Customer Experience Report")
-    date = st.text_input("Report Date", "April 2026")
+    satisfied = (data >= 4).sum()
+    return round((satisfied / total) * 100, 1)
 
-    if st.button("Generate Report 🚀"):
 
-        # ---------------- Calculations ----------------
-        csat_data = pd.to_numeric(df[csat_col], errors='coerce').dropna()
-        ces_data = pd.to_numeric(df[ces_col], errors='coerce').dropna()
-        nps_data = pd.to_numeric(df[nps_col], errors='coerce').dropna()
+def calculate_ces(df, column_name):
+    data = pd.to_numeric(df[column_name], errors="coerce").dropna()
+    total = len(data)
 
-        csat_score = (csat_data[csat_data >= 4].count() / len(csat_data)) * 100
-        ces_score = (ces_data[ces_data >= 5].count() / len(ces_data)) * 100
+    if total == 0:
+        return 0
 
-        promoters = nps_data[nps_data >= 9].count()
-        detractors = nps_data[nps_data <= 6].count()
-        nps_score = ((promoters / len(nps_data)) * 100) - ((detractors / len(nps_data)) * 100)
+    satisfied = (data >= 5).sum()
+    return round((satisfied / total) * 100, 1)
 
-        # ---------------- Placeholder Map ----------------
-        placeholder_map = {
-            "[[TITLE_01]]": title,
-            "[[DATE_01]]": date,
-            "[[CSAT_01]]": f"{csat_score:.1f}%",
-            "[[CES_01]]": f"{ces_score:.1f}%",
-            "[[NPS_01]]": f"{nps_score:.1f}"
-        }
 
-        # ---------------- Replace Text in PPT ----------------
-        prs = Presentation(ppt_file)
+def calculate_nps(df, column_name):
+    data = pd.to_numeric(df[column_name], errors="coerce").dropna()
+    total = len(data)
 
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    text = shape.text
-                    for key, value in placeholder_map.items():
-                        if key in text:
-                            shape.text = text.replace(key, value)
+    if total == 0:
+        return 0
 
-        # ---------------- Save Output ----------------
-        output = BytesIO()
-        prs.save(output)
-        output.seek(0)
+    promoters = (data >= 9).sum()
+    detractors = (data <= 6).sum()
 
-        st.success("Report Generated Successfully 🎉")
+    promoter_percent = (promoters / total) * 100
+    detractor_percent = (detractors / total) * 100
 
-        st.download_button(
-            label="Download PowerPoint",
-            data=output.getvalue(),
-            file_name="Automated_Report.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    return round(promoter_percent - detractor_percent, 1)
+
+
+def replace_placeholders(template_path, values):
+    prs = Presentation(template_path)
+
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+
+            for paragraph in shape.text_frame.paragraphs:
+                full_text = "".join(run.text for run in paragraph.runs)
+
+                for placeholder, value in values.items():
+                    full_text = full_text.replace(placeholder, str(value))
+
+                if paragraph.runs:
+                    paragraph.runs[0].text = full_text
+                    for run in paragraph.runs[1:]:
+                        run.text = ""
+
+    output = io.BytesIO()
+    prs.save(output)
+    output.seek(0)
+
+    return output
+
+
+def build_placeholder_reference():
+    return pd.DataFrame({
+        "Placeholder": [
+            "{{CSAT_RECEPTION}}",
+            "{{CSAT_DELIVERY}}",
+            "{{CSAT_FOOD}}",
+            "{{CSAT_OVERALL}}",
+            "{{CES_SCORE}}",
+            "{{NPS_SCORE}}",
+            "{{TOTAL_RESPONSES}}",
+            "{{REPORT_DATE}}",
+        ],
+        "Description": [
+            "Reception satisfaction score",
+            "Delivery satisfaction score",
+            "Food quality satisfaction score",
+            "Overall satisfaction score",
+            "Customer effort score",
+            "Net promoter score",
+            "Total survey responses",
+            "Report date",
+        ]
+    })
+
+
+st.title("📄 Report Automation")
+
+if not TEMPLATE_PATH.exists():
+    st.error("PowerPoint template not found.")
+    st.write("Looking for template here:")
+    st.code(str(TEMPLATE_PATH))
+    st.info("Please add your template here: templates/weekly_report_template.pptx")
+    st.stop()
+
+with st.expander("Template Preview & Placeholder Reference", expanded=True):
+    if PREVIEW_PATH.exists():
+        st.image(
+            str(PREVIEW_PATH),
+            caption="Report Template Preview",
+            use_container_width=True
         )
+    else:
+        st.info("Optional: add a preview image here: templates/weekly_report_preview.png")
+
+    st.dataframe(build_placeholder_reference(), use_container_width=True)
+
+uploaded_file = st.file_uploader(
+    "Upload Weekly Excel or CSV File",
+    type=["xlsx", "xls", "csv"]
+)
+
+if uploaded_file:
+    try:
+        df = load_data(uploaded_file)
+        df.columns = df.columns.astype(str).str.strip()
+
+        st.subheader("Select Columns")
+
+        csat_reception_col = st.selectbox("CSAT Reception Column", df.columns)
+        csat_delivery_col = st.selectbox("CSAT Delivery Column", df.columns)
+        csat_food_col = st.selectbox("CSAT Food Column", df.columns)
+        csat_overall_col = st.selectbox("CSAT Overall Column", df.columns)
+
+        ces_column = st.selectbox("CES Column", df.columns)
+        nps_column = st.selectbox("NPS Column", df.columns)
+
+        report_date = st.date_input("Report Date", value=date.today())
+
+        if st.button("Generate Automated Report", use_container_width=True):
+            values = {
+                "{{CSAT_RECEPTION}}": f"{calculate_csat(df, csat_reception_col)}%",
+                "{{CSAT_DELIVERY}}": f"{calculate_csat(df, csat_delivery_col)}%",
+                "{{CSAT_FOOD}}": f"{calculate_csat(df, csat_food_col)}%",
+                "{{CSAT_OVERALL}}": f"{calculate_csat(df, csat_overall_col)}%",
+                "{{CES_SCORE}}": f"{calculate_ces(df, ces_column)}%",
+                "{{NPS_SCORE}}": calculate_nps(df, nps_column),
+                "{{TOTAL_RESPONSES}}": len(df),
+                "{{REPORT_DATE}}": report_date.strftime("%Y-%m-%d"),
+            }
+
+            report_output = replace_placeholders(TEMPLATE_PATH, values)
+
+            st.success("Report generated successfully")
+
+            st.download_button(
+                label="Download PowerPoint Report",
+                data=report_output.getvalue(),
+                file_name="automated_weekly_report.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            )
+
+    except Exception as e:
+        st.error(f"Error while generating report: {e}")
